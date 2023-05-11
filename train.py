@@ -28,12 +28,13 @@ from losses import (
   generator_loss,
   discriminator_loss,
   feature_loss,
-  kl_loss
+  kl_loss,
+  bdp_loss
 )
 from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from text.symbols import symbols
 
-
+NUM_WORKERS = 4
 torch.backends.cudnn.benchmark = True
 global_step = 0
 
@@ -44,10 +45,19 @@ def main():
 
   n_gpus = torch.cuda.device_count()
   os.environ['MASTER_ADDR'] = 'localhost'
-  os.environ['MASTER_PORT'] = '80000'
+  os.environ['MASTER_PORT'] = '29500'
 
   hps = utils.get_hparams()
-  mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
+
+  print("# of GPUs:", n_gpus)
+  if n_gpus > 1:
+    mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
+    #run(0, n_gpus, hps) # for debugging purposes
+  elif n_gpus == 1:
+    run_singleGPU(hps) 
+  else:
+    print("Error with the number of GPUs.")
+    return
 
 
 def run(rank, n_gpus, hps):
@@ -59,11 +69,12 @@ def run(rank, n_gpus, hps):
     writer = SummaryWriter(log_dir=hps.model_dir)
     writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
-  dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
+  dist.init_process_group(backend='gloo', init_method='env://', world_size=n_gpus, rank=rank)
   torch.manual_seed(hps.train.seed)
   torch.cuda.set_device(rank)
 
   train_dataset = TextAudioLoader(hps.data.training_files, hps.data)
+  train_no_disfl_dataset = TextAudioLoader(hps.data.training_no_disfl_files, hps.data)
   train_sampler = DistributedBucketSampler(
       train_dataset,
       hps.train.batch_size,
@@ -72,11 +83,13 @@ def run(rank, n_gpus, hps):
       rank=rank,
       shuffle=True)
   collate_fn = TextAudioCollate()
-  train_loader = DataLoader(train_dataset, num_workers=8, shuffle=False, pin_memory=True,
+  train_loader = DataLoader(train_dataset, num_workers=NUM_WORKERS, shuffle=False, pin_memory=True,
+      collate_fn=collate_fn, batch_sampler=train_sampler)
+  train_no_disfl_loader = DataLoader(train_no_disfl_dataset, num_workers=NUM_WORKERS, shuffle=False, pin_memory=True,
       collate_fn=collate_fn, batch_sampler=train_sampler)
   if rank == 0:
     eval_dataset = TextAudioLoader(hps.data.validation_files, hps.data)
-    eval_loader = DataLoader(eval_dataset, num_workers=8, shuffle=False,
+    eval_loader = DataLoader(eval_dataset, num_workers=NUM_WORKERS, shuffle=False,
         batch_size=hps.train.batch_size, pin_memory=True,
         drop_last=False, collate_fn=collate_fn)
 
@@ -114,14 +127,76 @@ def run(rank, n_gpus, hps):
 
   for epoch in range(epoch_str, hps.train.epochs + 1):
     if rank==0:
-      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, eval_loader], logger, [writer, writer_eval])
+      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, eval_loader], train_no_disfl_loader, logger, [writer, writer_eval])
     else:
       train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, None], None, None)
     scheduler_g.step()
     scheduler_d.step()
 
 
-def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers):
+def run_singleGPU(hps):
+  global global_step
+  logger = utils.get_logger(hps.model_dir)
+  logger.info(hps)
+  utils.check_git_hash(hps.model_dir)
+  writer = SummaryWriter(log_dir=hps.model_dir)
+  writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
+
+  torch.manual_seed(hps.train.seed)
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+  train_dataset = TextAudioLoader(hps.data.training_files, hps.data)
+  train_no_disfl_dataset = TextAudioLoader(hps.data.training_no_disfl_files, hps.data)
+
+  collate_fn = TextAudioCollate()
+  train_loader = DataLoader(train_dataset, num_workers=NUM_WORKERS, shuffle=True, pin_memory=True,
+      collate_fn=collate_fn, batch_size=hps.train.batch_size)
+  train_no_disfl_loader = DataLoader(train_no_disfl_dataset, num_workers=NUM_WORKERS, shuffle=True, pin_memory=True,
+      collate_fn=collate_fn, batch_size=hps.train.batch_size)
+
+  eval_dataset = TextAudioLoader(hps.data.validation_files, hps.data)
+  eval_loader = DataLoader(eval_dataset, num_workers=NUM_WORKERS, shuffle=False,
+      batch_size=hps.train.batch_size, pin_memory=True,
+      drop_last=False, collate_fn=collate_fn)
+
+  net_g = SynthesizerTrn(
+      len(symbols),
+      hps.data.filter_length // 2 + 1,
+      hps.train.segment_size // hps.data.hop_length,
+      **hps.model).to(device)
+  net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).to(device)
+  optim_g = torch.optim.AdamW(
+      net_g.parameters(), 
+      hps.train.learning_rate, 
+      betas=hps.train.betas, 
+      eps=hps.train.eps)
+  optim_d = torch.optim.AdamW(
+      net_d.parameters(),
+      hps.train.learning_rate, 
+      betas=hps.train.betas, 
+      eps=hps.train.eps)
+
+  try:
+    _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g)
+    _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d)
+    global_step = (epoch_str - 1) * len(train_loader)
+  except:
+    epoch_str = 1
+    global_step = 0
+
+  scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
+  scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
+
+  scaler = GradScaler(enabled=hps.train.fp16_run)
+
+  for epoch in range(epoch_str, hps.train.epochs + 1):
+    train_and_evaluate(0, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, eval_loader], train_no_disfl_loader, logger, [writer, writer_eval], singleGPU = True)
+    scheduler_g.step()
+    scheduler_d.step()
+
+
+
+def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, train_no_disfl_loader, logger, writers, singleGPU = False):
   net_g, net_d = nets
   optim_g, optim_d = optims
   scheduler_g, scheduler_d = schedulers
@@ -129,19 +204,25 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
   if writers is not None:
     writer, writer_eval = writers
 
-  train_loader.batch_sampler.set_epoch(epoch)
+  if not singleGPU:
+    train_loader.batch_sampler.set_epoch(epoch)
+
   global global_step
 
   net_g.train()
   net_d.train()
-  for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths) in enumerate(train_loader):
+  print("Starting...")
+  batch_idx = 0
+  for (x, x_lengths, spec, spec_lengths, y, y_lengths), (x_no_disfl, x_lengths_no_disfl, _, _, _, _) in zip(train_loader, train_no_disfl_loader):
+    print("Batch", batch_idx + 1)
     x, x_lengths = x.cuda(rank, non_blocking=True), x_lengths.cuda(rank, non_blocking=True)
+    x_no_disfl, x_lengths_no_disfl = x_no_disfl.cuda(rank, non_blocking=True), x_lengths_no_disfl.cuda(rank, non_blocking=True)
     spec, spec_lengths = spec.cuda(rank, non_blocking=True), spec_lengths.cuda(rank, non_blocking=True)
     y, y_lengths = y.cuda(rank, non_blocking=True), y_lengths.cuda(rank, non_blocking=True)
 
     with autocast(enabled=hps.train.fp16_run):
       y_hat, l_length, attn, ids_slice, x_mask, z_mask,\
-      (z, z_p, m_p, logs_p, m_q, logs_q) = net_g(x, x_lengths, spec, spec_lengths)
+      (z, z_p, m_p, logs_p, m_q, logs_q), (x_disfl_pred, x_disfluency) = net_g(x, x_lengths, x_no_disfl, x_lengths_no_disfl, spec, spec_lengths)
 
       mel = spec_to_mel_torch(
           spec, 
@@ -185,7 +266,8 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
 
         loss_fm = feature_loss(fmap_r, fmap_g)
         loss_gen, losses_gen = generator_loss(y_d_hat_g)
-        loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+        loss_bdp = bdp_loss(x_disfl_pred, x_disfluency)
+        loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl + loss_bdp
     optim_g.zero_grad()
     scaler.scale(loss_gen_all).backward()
     scaler.unscale_(optim_g)
@@ -196,13 +278,16 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     if rank==0:
       if global_step % hps.train.log_interval == 0:
         lr = optim_g.param_groups[0]['lr']
-        losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
+        losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl, loss_bdp]
+        print('Train Epoch: {} [{:.0f}%]'.format(
+          epoch,
+          100. * batch_idx / len(train_loader)))
         logger.info('Train Epoch: {} [{:.0f}%]'.format(
           epoch,
           100. * batch_idx / len(train_loader)))
         logger.info([x.item() for x in losses] + [global_step, lr])
         
-        scalar_dict = {"loss/g/total": loss_gen_all, "loss/d/total": loss_disc_all, "learning_rate": lr, "grad_norm_d": grad_norm_d, "grad_norm_g": grad_norm_g}
+        scalar_dict = {"loss/g/total": loss_gen_all, "loss/d/total": loss_disc_all, "learning_rate": lr, "grad_norm_d": grad_norm_d, "grad_norm_g": grad_norm_g, "loss/bdp": loss_bdp}
         scalar_dict.update({"loss/g/fm": loss_fm, "loss/g/mel": loss_mel, "loss/g/dur": loss_dur, "loss/g/kl": loss_kl})
 
         scalar_dict.update({"loss/g/{}".format(i): v for i, v in enumerate(losses_gen)})
@@ -228,6 +313,8 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
   
   if rank == 0:
     logger.info('====> Epoch: {}'.format(epoch))
+
+  batch_idx += 1
 
  
 def evaluate(hps, generator, eval_loader, writer_eval):
