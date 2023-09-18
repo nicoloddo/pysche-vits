@@ -20,7 +20,7 @@ if __name__ == '__main__':
   parser.add_argument("--text_index", default=1, type=int)
   #parser.add_argument("--filelists", nargs="+", default=["filelists/ljs_audio_text_val_filelist.txt", "filelists/ljs_audio_text_test_filelist.txt"])
   parser.add_argument("--filelists", nargs="+", default=[
-      "D:/OneDrive - Universiteit Utrecht/Documents/000 - Documenti/PROJECTS/PSYCHE/Dataset/INTERSPEECH/ComParE2020_Breathing/transcriptions_and_alignments/gentle_mfa_assemblyAI/breath1/token_augmented/segmented_alignment/filelist/INTERSPEECH_segmented_filelist.txt"])
+      "filelists/IEMOCAP_INTERSPEECH_filelist_train", "filelists/IEMOCAP_INTERSPEECH_filelist_val"])
   parser.add_argument("--text_cleaners", nargs="+", default=["english_cleaners2"])
 
   args = parser.parse_args()
