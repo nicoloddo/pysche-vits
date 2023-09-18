@@ -34,10 +34,11 @@ from losses import (
 from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from text.symbols import symbols
 
-NUM_WORKERS = 4
+NUM_WORKERS = 2
 torch.backends.cudnn.benchmark = True
 global_step = 0
 
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:40'
 
 def main():
   """Assume Single Node Multi GPUs Training Only"""
@@ -49,12 +50,14 @@ def main():
 
   hps = utils.get_hparams()
 
+  torch.cuda.empty_cache()
   print("# of GPUs:", n_gpus)
   if n_gpus > 1:
     mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
     #run(0, n_gpus, hps) # for debugging purposes
   elif n_gpus == 1:
-    run_singleGPU(hps) 
+    #run_singleGPU(hps) 
+    mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
   else:
     print("Error with the number of GPUs.")
     return
